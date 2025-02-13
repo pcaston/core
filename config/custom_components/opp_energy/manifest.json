@@ -1,0 +1,12 @@
+{
+  "domain": "opp_energy",
+  "name": "OPP Energy Manager",
+  "codeowners": [],
+  "documentation": "https://www.openpeerpower.io",
+  "dependencies": [],
+  "iot_class": "cloud_polling",
+  "quality_scale": "bronze",
+  "requirements": ["websockets>=10.0"],
+  "version": "0.1.0",
+  "config_flow": true
+}

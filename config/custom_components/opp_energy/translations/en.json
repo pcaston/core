@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to OPP Energy Cloud",
+        "data": {
+          "instance_id": "Instance ID",
+          "api_token": "API Token",
+          "cloud_url": "Cloud URL"
+        }
+      }
+    },
+    "error": {
+      "connection_error": "Failed to connect to OPP Energy Cloud"
+    }
+  }
+}

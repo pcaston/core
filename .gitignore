@@ -1,5 +1,15 @@
-/config
+# /config
 config2/*
+config/.HA_VERSION
+config/.storage
+config/automations.yaml
+config/blueprints/
+config/configuration.yaml
+config/home-assistant.log.1
+config/home-assistant_v2.db
+config/scenes.yaml
+config/scripts.yaml
+config/secrets.yaml
 
 tests/testing_config/deps
 tests/testing_config/home-assistant.log*
