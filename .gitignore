@@ -68,6 +68,7 @@ pip-wheel-metadata
 
 # Logs
 *.log
+*.log.*
 pip-log.txt
 
 # Unit test / coverage reports
@@ -147,3 +148,6 @@ tmp_cache
 
 # Will be created from script/split_tests.py
 pytest_buckets.txt
+
+config/home-assistant_v2.*
+sqlite-autoconf-3490000/
