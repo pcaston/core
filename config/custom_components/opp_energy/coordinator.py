@@ -58,7 +58,7 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
             self.ws = await connect(
                 self.websocket_url,
                 ping_interval=20,
-                ping_timeout=10,
+                ping_timeout=20,
             )
             _LOGGER.debug("WebSocket connection established")
 
@@ -101,7 +101,7 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
             return None
         if msg_type == "auth_failed":
             raise UpdateFailed(f"Authentication failed: {message.get('message', 'Unknown error')}")
-        if msg_type == "prices":
+        if msg_type == "price_update":
             _LOGGER.debug("Received price data")
             return message.get("data", {})
         _LOGGER.debug("Received message of type: %s", msg_type)

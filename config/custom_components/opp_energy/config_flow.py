@@ -31,7 +31,7 @@ class OppEnergyConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         session = async_get_clientsession(hass)
 
         # Convert HTTP URL to WebSocket URL for initial test
-        ws_url = f"{DEFAULT_CLOUD_URL.replace('http', 'ws').rstrip('/')}/ws/opp_energy/"
+        ws_url = f"{DEFAULT_CLOUD_URL.replace('http', 'ws').rstrip('/')}"
 
         try:
             # Test WebSocket connection

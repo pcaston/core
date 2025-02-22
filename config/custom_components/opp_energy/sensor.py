@@ -7,7 +7,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CURRENCY_EURO
+from homeassistant.const import CURRENCY_DOLLAR
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -38,16 +38,18 @@ class OppEnergyPriceSensor(CoordinatorEntity, SensorEntity):
         self._entry = entry
         self._attr_unique_id = f"{coordinator.instance_id}_price"
         self._attr_name = f"Energy Price {coordinator.user_name}"
-        self._attr_native_unit_of_measurement = CURRENCY_EURO
+        self._attr_native_unit_of_measurement = CURRENCY_DOLLAR
         self._attr_device_class = SensorDeviceClass.MONETARY
-        self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_state_class = SensorStateClass.TOTAL
 
     @property
     def native_value(self):
         """Return the state of the sensor."""
         if self.coordinator.data:
-            # Handle both WebSocket data format and API data format
             if isinstance(self.coordinator.data, dict):
+                # Check for both price formats
+                if "buy_price" in self.coordinator.data:
+                    return self.coordinator.data.get("buy_price")
                 return self.coordinator.data.get("price")
             return self.coordinator.data
         return None
@@ -69,15 +71,18 @@ class OppEnergyPriceSensor(CoordinatorEntity, SensorEntity):
         return self.coordinator.last_update_success and self.coordinator.data is not None
 
     @property
-    def extra_state_attributes(self) -> dict:
+    def extra_state_attributes(self):
         """Return additional state attributes."""
         if not self.coordinator.data or not isinstance(self.coordinator.data, dict):
             return {}
 
-        # Extract any additional price-related data from WebSocket updates
         attributes = {}
-        for key, value in self.coordinator.data.items():
-            if key.startswith("price_"):
-                attributes[key.replace("price_", "")] = value
+        # Include both buy and sell prices in attributes
+        if "buy_price" in self.coordinator.data:
+            attributes["buy_price"] = self.coordinator.data["buy_price"]
+        if "sell_price" in self.coordinator.data:
+            attributes["sell_price"] = self.coordinator.data["sell_price"]
+        if "timestamp" in self.coordinator.data:
+            attributes["last_update"] = self.coordinator.data["timestamp"]
 
         return attributes
