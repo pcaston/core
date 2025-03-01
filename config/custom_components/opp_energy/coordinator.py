@@ -23,7 +23,7 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
         user_name: str,
         email: str,
         password: str,
-        device_name: str,
+        site_name: str,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -36,13 +36,14 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
         self.user_name = user_name
         self.email = email
         self.password = password
-        self.device_name = device_name
+        self.site_name = site_name
         self.ws: WebSocketClientProtocol | None = None
         self._authenticated = False
         self._last_data = None
         self._reconnect_task = None
         self._keep_alive_task = None
-        self.instance_id = f"opp_energy_{user_name}_{device_name}"
+        self._listener_task = None
+        self.instance_id = f"opp_energy_{email}_{site_name}"
 
     def _is_connected(self) -> bool:
         """Check if the WebSocket connection is active."""
@@ -66,6 +67,10 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
             if self._keep_alive_task is None or self._keep_alive_task.done():
                 self._keep_alive_task = asyncio.create_task(self._keep_alive())
 
+            # Start message listener task
+            if self._listener_task is None or self._listener_task.done():
+                self._listener_task = asyncio.create_task(self._listen_for_messages())
+
             if not self._authenticated:
                 await self._authenticate()
 
@@ -82,6 +87,64 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
             try:
                 if self._is_connected():
                     await self._send_message({"type": "ping"})
+                await asyncio.sleep(30)  # Send message every 30 seconds
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.error("Keep-alive error: %s", e)
+                self.ws = None
+                await asyncio.sleep(5)  # Wait before retrying
+
+    async def _listen_for_messages(self) -> None:
+        """Listen for incoming WebSocket messages continuously."""
+        while self._is_connected():
+            try:
+                message = await self.ws.recv()
+                parsed_message = json.loads(message)
+                _LOGGER.debug("Received message: %s", parsed_message)
+                processed_data = await self._process_message(parsed_message)
+
+                if processed_data is not None:
+                    self._last_data = processed_data
+                    # Update the coordinator's data and notify entities
+                    self.async_set_updated_data(self._last_data)
+            except Exception as error:  # noqa: BLE001
+                _LOGGER.error("Error in message listener: %s", error)
+                self.ws = None
+                # Schedule reconnection
+                if self._reconnect_task is None or self._reconnect_task.done():
+                    self._reconnect_task = asyncio.create_task(self._reconnect())
+                break
+
+    async def _reconnect(self) -> None:
+        """Handle reconnection to WebSocket server."""
+        retry_count = 0
+        max_retries = 5
+        retry_delay = 5  # seconds
+
+        while retry_count < max_retries:
+            _LOGGER.info("Attempting to reconnect to WebSocket (attempt %s of %s)",
+                        retry_count + 1, max_retries)
+            try:
+                await self._connect()
+                if self._is_connected():
+                    _LOGGER.info("Successfully reconnected to WebSocket")
+                    return
+            except Exception as error:  # noqa: BLE001
+                _LOGGER.error("Reconnection attempt failed: %s", error)
+
+            retry_count += 1
+            await asyncio.sleep(retry_delay)
+
+        _LOGGER.error("Failed to reconnect after %s attempts", max_retries)
+
+    async def _keep_alive(self) -> None:
+        """Keep the WebSocket connection alive."""
+        while True:
+            try:
+                if self._is_connected():
+                    await self._send_message({"type": "ping"})
+                # Try to reconnect if connection is lost
+                elif self._reconnect_task is None or self._reconnect_task.done():
+                    self._reconnect_task = asyncio.create_task(self._reconnect())
                 await asyncio.sleep(30)  # Send message every 30 seconds
             except Exception as e:  # noqa: BLE001
                 _LOGGER.error("Keep-alive error: %s", e)
@@ -115,10 +178,10 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
         try:
             auth_message = {
                 "type": "authenticate",
-                "user_name": self.user_name,
-                "email": self.email,
+                "user_name": self.user_name,  # Pass as display name
+                "email": self.email,  # This is used as username
                 "password": self.password,
-                "device_name": self.device_name
+                "site_name": self.site_name
             }
             _LOGGER.debug("Sending authentication message")
 
@@ -131,8 +194,9 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
                 # Subscribe to price updates after successful authentication
                 await self._send_message({
                     "type": "subscribe_prices",
-                    "user_name": self.user_name
+                    "user_name": self.email  # Use email as username for subscription
                 })
+                _LOGGER.debug("Subscribed to price updates")
             else:
                 raise UpdateFailed("Authentication failed")  # noqa: TRY301
 
@@ -141,6 +205,19 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Authentication error: %s", error)
             self.ws = None
             raise UpdateFailed(f"Authentication error: {error}") from error
+
+    async def _send_message(self, message: dict) -> None:
+        """Send a message through the WebSocket connection."""
+        if not self._is_connected():
+            await self._connect()
+
+        try:
+            await self.ws.send(json.dumps(message))
+            _LOGGER.debug("Sent message: %s", message)
+        except Exception as error:
+            _LOGGER.error("Error sending message: %s", error)
+            self.ws = None
+            raise UpdateFailed(f"Failed to send message: {error}") from error
 
     async def _send_message(self, message: dict) -> None:
         """Send a message through the WebSocket connection."""
@@ -171,28 +248,48 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Failed to receive message: {error}") from error
 
     async def _async_update_data(self) -> dict:
-        """Fetch latest data from the WebSocket connection."""
+        """Check connection health and return latest data."""
         try:
             if not self._is_connected():
                 await self._connect()
 
-            # Request latest prices
-            await self._send_message({
-                "type": "get_prices",
-                "user_name": self.user_name
-            })
+            # Make sure we're authenticated before requesting data
+            if not self._authenticated:
+                await self._authenticate()
 
-            while True:  # Keep receiving messages until we get price data
-                response = await self._receive_message()
-                processed_data = await self._process_message(response)
+            # The actual data updates should come from the continuous message listener
+            if self._last_data is None:
+                # Only request data if we don't have any yet
+                await self._send_message({
+                    "type": "get_prices",
+                    "user_name": self.user_name
+                })
+                # Wait briefly for a response
+                await asyncio.sleep(1)
 
-                if processed_data is not None:
-                    self._last_data = processed_data
-                    return self._last_data
+            return self._last_data or {}  # noqa: TRY300
 
         except Exception as error:
-            _LOGGER.error("Error updating data: %s", error)
-            # If we have previous data, return it instead of failing
+            _LOGGER.error("Error in update coordinator: %s", error)
             if self._last_data is not None:
                 return self._last_data
             raise UpdateFailed(f"Failed to update data: {error}") from error
+
+    async def async_shutdown(self) -> None:
+        """Close WebSocket connection on shutdown."""
+        _LOGGER.debug("Shutting down OPP Energy coordinator")
+
+        # Cancel background tasks
+        if self._keep_alive_task and not self._keep_alive_task.done():
+            self._keep_alive_task.cancel()
+
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+
+        if self._listener_task and not self._listener_task.done():
+            self._listener_task.cancel()
+
+        # Close WebSocket connection
+        if self.ws is not None and not self.ws.closed:
+            await self.ws.close()
+            self.ws = None
