@@ -14,7 +14,7 @@ from .const import DEFAULT_CLOUD_URL, DOMAIN, UPDATE_INTERVAL
 _LOGGER = logging.getLogger(__name__)
 
 class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching OPP Energy data."""
+    """Class to manage fetching OPP Energy data and providing remote access."""
 
     def __init__(
         self,
@@ -44,10 +44,30 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
         self._listener_task = None
         self.instance_id = f"opp_energy_{email}_{site_name}"
 
+        # Store reference to the Home Assistant instance
+        self._hass = hass
+
+        # For remote access session tracking
+        self._remote_sessions = {}
+        self._remote_command_handlers = {
+            "get_states": self._handle_get_states,
+            "call_service": self._handle_call_service,
+            "get_services": self._handle_get_services,
+            "get_config": self._handle_get_config,
+            "get_areas": self._handle_get_areas,
+            "get_devices": self._handle_get_devices,
+            "get_entities": self._handle_get_entities,
+            "subscribe_events": self._handle_subscribe_events,
+            "unsubscribe_events": self._handle_unsubscribe_events,
+        }
+
         # Message queue for synchronization
         self._message_queue = asyncio.Queue()
         self._response_futures = {}
         self._next_message_id = 0
+
+        # Event subscription tracking
+        self._event_subscriptions = {}
 
     def _is_connected(self) -> bool:
         """Check if the WebSocket connection is active."""
@@ -125,6 +145,16 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
                         self.async_set_updated_data(self._last_data)
                     continue
 
+                # Handle remote access commands
+                if msg_type == "remote_command":
+                    await self._handle_remote_command(parsed_message)
+                    continue
+
+                # Handle Home Assistant state request
+                if msg_type == "get_hass_state_request":
+                    await self._handle_hass_state_request(parsed_message)
+                    continue
+
                 # For other message types, check if it's a response to a pending request
                 message_id = parsed_message.get("id")
                 if message_id and message_id in self._response_futures:
@@ -139,6 +169,69 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
                 if self._reconnect_task is None or self._reconnect_task.done():
                     self._reconnect_task = asyncio.create_task(self._reconnect())
                 break
+
+    async def _handle_hass_state_request(self, message: dict) -> None:
+        """Handle request for Home Assistant state."""
+        instance_id = message.get("instance_id")
+        entity_id = message.get("entity_id")
+        message_id = message.get("id")
+
+        # Verify this request is for us
+        if instance_id != self.instance_id:
+            _LOGGER.debug("Ignoring state request for different instance: %s", instance_id)
+            return
+
+        _LOGGER.debug("Processing Home Assistant state request: %s", message)
+
+        try:
+            # Collect states
+            if entity_id:
+                # Get specific entity state
+                state = self._hass.states.get(entity_id)
+                if state is None:
+                    await self._send_message_without_response({
+                        "type": "hass_state_response",
+                        "success": False,
+                        "error": f"Entity not found: {entity_id}",
+                        "id": message_id
+                    })
+                    return
+
+                states_data = {
+                    entity_id: {
+                        "state": state.state,
+                        "attributes": dict(state.attributes),
+                        "last_changed": state.last_changed.isoformat(),
+                        "last_updated": state.last_updated.isoformat()
+                    }
+                }
+            else:
+                # Get all states
+                states_data = {}
+                for state in self._hass.states.async_all():
+                    states_data[state.entity_id] = {
+                        "state": state.state,
+                        "attributes": dict(state.attributes),
+                        "last_changed": state.last_changed.isoformat(),
+                        "last_updated": state.last_updated.isoformat()
+                    }
+
+            # Send response with states
+            await self._send_message_without_response({
+                "type": "hass_state_response",
+                "success": True,
+                "data": states_data,
+                "id": message_id
+            })
+
+        except Exception as error:  # noqa: BLE001
+            _LOGGER.error("Error handling Home Assistant state request: %s", error)
+            await self._send_message_without_response({
+                "type": "hass_state_response",
+                "success": False,
+                "error": str(error),
+                "id": message_id
+            })
 
     async def _keep_alive(self) -> None:
         """Keep the WebSocket connection alive."""
@@ -254,6 +347,15 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
             })
             _LOGGER.debug("Subscribed to price updates")
 
+            # Register this instance for remote access
+            await self._send_message_without_response({
+                "type": "register_remote_access",
+                "user_name": self.email,
+                "site_name": self.site_name,
+                "instance_id": self.instance_id
+            })
+            _LOGGER.debug("Registered for remote access")
+
         except Exception as error:
             self._authenticated = False
             _LOGGER.error("Authentication error: %s", error)
@@ -307,7 +409,276 @@ class OppEnergyDataUpdateCoordinator(DataUpdateCoordinator):
                 future.cancel()
         self._response_futures.clear()
 
+        # Clean up event subscriptions
+        for unsub in self._event_subscriptions.values():
+            if callable(unsub):
+                unsub()
+        self._event_subscriptions.clear()
+
         # Close WebSocket connection
         if self.ws is not None and not self.ws.closed:
             await self.ws.close()
             self.ws = None
+
+    # Remote access methods
+
+    async def _handle_remote_command(self, message: dict) -> None:
+        """Process remote command from the cloud server."""
+        command = message.get("command")
+        session_id = message.get("session_id")
+        command_id = message.get("command_id")
+
+        if not session_id:
+            _LOGGER.error("Received remote command without session_id")
+            return
+
+        if command not in self._remote_command_handlers:
+            _LOGGER.error("Unknown remote command: %s", command)
+            await self._send_message_without_response({
+                "type": "remote_response",
+                "session_id": session_id,
+                "command_id": command_id,
+                "success": False,
+                "error": f"Unknown command: {command}"
+            })
+            return
+
+        try:
+            # Register this session if it's new
+            if session_id not in self._remote_sessions:
+                self._remote_sessions[session_id] = {
+                    "created_at": asyncio.get_event_loop().time(),
+                    "last_activity": asyncio.get_event_loop().time(),
+                    "subscriptions": []
+                }
+            else:
+                # Update last activity
+                self._remote_sessions[session_id]["last_activity"] = asyncio.get_event_loop().time()
+
+            # Execute the command handler
+            handler = self._remote_command_handlers[command]
+            result = await handler(message)
+
+            # Send the response
+            await self._send_message_without_response({
+                "type": "remote_response",
+                "session_id": session_id,
+                "command_id": command_id,
+                "success": True,
+                "result": result
+            })
+
+        except Exception as error:  # noqa: BLE001
+            _LOGGER.error("Error handling remote command %s: %s", command, error)
+            await self._send_message_without_response({
+                "type": "remote_response",
+                "session_id": session_id,
+                "command_id": command_id,
+                "success": False,
+                "error": str(error)
+            })
+
+    async def _handle_get_states(self, message: dict) -> dict:
+        """Handle get_states command."""
+        entity_id = message.get("entity_id")
+
+        if entity_id:
+            state = self._hass.states.get(entity_id)
+            if state is None:
+                raise ValueError(f"Entity not found: {entity_id}")
+            return {
+                "entity_id": state.entity_id,
+                "state": state.state,
+                "attributes": dict(state.attributes),
+                "last_changed": state.last_changed.isoformat(),
+                "last_updated": state.last_updated.isoformat()
+            }
+        result = []
+        for state in self._hass.states.async_all():
+            result.append({  # noqa: PERF401
+                "entity_id": state.entity_id,
+                "state": state.state,
+                "attributes": dict(state.attributes),
+                "last_changed": state.last_changed.isoformat(),
+                "last_updated": state.last_updated.isoformat()
+            })
+        return result
+
+    async def _handle_call_service(self, message: dict) -> dict:
+        """Handle call_service command."""
+        domain = message.get("domain")
+        service = message.get("service")
+        service_data = message.get("service_data", {})
+        target = message.get("target")
+
+        if not domain or not service:
+            raise ValueError("Domain and service are required")
+
+        # Construct service call parameters
+        params = {"domain": domain, "service": service}
+
+        if service_data:
+            params["service_data"] = service_data
+
+        if target:
+            params["target"] = target
+
+        # Make the service call
+        await self._hass.services.async_call(**params, blocking=True)
+
+        return {"success": True}
+
+    async def _handle_get_services(self, message: dict) -> dict:
+        """Handle get_services command."""
+        domain = message.get("domain")
+        services = {}  # noqa: F841
+
+        services_domains = await self._hass.services.async_get_services()
+
+        if domain:
+            if domain not in services_domains:
+                raise ValueError(f"Domain not found: {domain}")
+            return {domain: services_domains[domain]}
+
+        return services_domains
+
+    async def _handle_get_config(self, message: dict) -> dict:
+        """Handle get_config command."""
+        return {
+            "location_name": self._hass.config.location_name,
+            "latitude": self._hass.config.latitude,
+            "longitude": self._hass.config.longitude,
+            "elevation": self._hass.config.elevation,
+            "time_zone": str(self._hass.config.time_zone),
+            "unit_system": self._hass.config.units.as_dict(),
+            "version": self._hass.config.version,
+            "state": self._hass.state.value
+        }
+
+    async def _handle_get_areas(self, message: dict) -> dict:
+        """Handle get_areas command."""
+        area_registry = self._hass.data["area_registry"]
+        areas = []
+
+        for area in area_registry.async_list_areas():
+            areas.append({  # noqa: PERF401
+                "area_id": area.id,
+                "name": area.name,
+                "picture": area.picture
+            })
+
+        return areas
+
+    async def _handle_get_devices(self, message: dict) -> dict:
+        """Handle get_devices command."""
+        device_registry = self._hass.data["device_registry"]
+        devices = []
+
+        for device in device_registry.devices.values():
+            devices.append({  # noqa: PERF401
+                "id": device.id,
+                "name": device.name_by_user or device.name,
+                "manufacturer": device.manufacturer,
+                "model": device.model,
+                "sw_version": device.sw_version,
+                "area_id": device.area_id,
+                "connections": [list(conn) for conn in device.connections],
+                "identifiers": [list(ident) for ident in device.identifiers],
+                "disabled": device.disabled,
+                "disabled_by": device.disabled_by,
+                "via_device_id": device.via_device_id
+            })
+
+        return devices
+
+    async def _handle_get_entities(self, message: dict) -> dict:
+        """Handle get_entities command."""
+        entity_registry = self._hass.data["entity_registry"]
+        entities = []
+
+        for entity in entity_registry.entities.values():
+            entities.append({  # noqa: PERF401
+                "entity_id": entity.entity_id,
+                "name": entity.name,
+                "device_id": entity.device_id,
+                "area_id": entity.area_id,
+                "disabled": entity.disabled,
+                "disabled_by": entity.disabled_by,
+                "platform": entity.platform,
+                "domain": entity.domain,
+                "unique_id": entity.unique_id,
+                "has_entity_name": entity.has_entity_name,
+                "original_name": entity.original_name
+            })
+
+        return entities
+
+    async def _forward_event(self, session_id, subscription_id, event):
+        """Forward events to the WebSocket client."""
+        if not self._is_connected():
+            return
+
+        event_data = {
+            "event_type": event.event_type,
+            "data": dict(event.data),
+            "origin": event.origin,
+            "time_fired": event.time_fired.isoformat(),
+            "context": {
+                "id": event.context.id,
+                "parent_id": event.context.parent_id,
+                "user_id": event.context.user_id
+            }
+        }
+
+        await self._send_message_without_response({
+            "type": "remote_event",
+            "session_id": session_id,
+            "subscription_id": subscription_id,
+            "event": event_data
+        })
+
+    async def _handle_subscribe_events(self, message: dict) -> dict:
+        """Handle subscribe_events command."""
+        session_id = message.get("session_id")
+        event_type = message.get("event_type")
+        subscription_id = f"{session_id}_{event_type or 'all'}"
+
+        # Check if already subscribed
+        if subscription_id in self._event_subscriptions:
+            return {"subscription_id": subscription_id}
+
+        # Create the event callback
+        callback = lambda event: asyncio.create_task(  # noqa: E731
+            self._forward_event(session_id, subscription_id, event)
+        )
+
+        # Subscribe to the event
+        unsub = self._hass.bus.async_listen(event_type, callback)
+
+        # Store the subscription
+        self._event_subscriptions[subscription_id] = unsub
+
+        # Add to session tracking
+        if session_id in self._remote_sessions:
+            self._remote_sessions[session_id]["subscriptions"].append(subscription_id)
+
+        return {"subscription_id": subscription_id}
+
+    async def _handle_unsubscribe_events(self, message: dict) -> dict:
+        """Handle unsubscribe_events command."""
+        subscription_id = message.get("subscription_id")
+
+        if not subscription_id or subscription_id not in self._event_subscriptions:
+            raise ValueError(f"Subscription not found: {subscription_id}")
+
+        # Unsubscribe
+        unsub = self._event_subscriptions.pop(subscription_id)
+        unsub()
+
+        # Remove from session tracking
+        session_id = subscription_id.split("_")[0]
+        if session_id in self._remote_sessions:
+            if subscription_id in self._remote_sessions[session_id]["subscriptions"]:
+                self._remote_sessions[session_id]["subscriptions"].remove(subscription_id)
+
+        return {"success": True}
